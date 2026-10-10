@@ -1,6 +1,6 @@
+
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { getDb } from "@/lib/db";
 import {
   verifyPassword,
   signSession,
@@ -8,6 +8,7 @@ import {
   checkRateLimit,
   logSecurityEvent,
   logAudit,
+  getActiveAuthRepository,
 } from "@/lib/auth";
 
 export const runtime = "nodejs";
@@ -22,8 +23,8 @@ export async function POST(req: NextRequest) {
     const ip = req.headers.get("x-forwarded-for") || "127.0.0.1";
     const userAgent = req.headers.get("user-agent") || "unknown";
 
-    // 1. Rate Limiting Check (5 attempts / min)
     const rateLimit = checkRateLimit(`login:${ip}`);
+
     if (!rateLimit.allowed) {
       await logSecurityEvent({
         eventType: "rate_limit_exceeded",
@@ -32,6 +33,7 @@ export async function POST(req: NextRequest) {
         severity: "high",
         details: { endpoint: "/api/auth/login" },
       });
+
       return NextResponse.json(
         { error: "Too many login attempts. Please wait 60 seconds before trying again." },
         { status: 429 }
@@ -40,6 +42,7 @@ export async function POST(req: NextRequest) {
 
     const body = await req.json();
     const parsed = LoginSchema.safeParse(body);
+
     if (!parsed.success) {
       return NextResponse.json(
         { error: parsed.error.errors[0]?.message || "Invalid input" },
@@ -48,41 +51,44 @@ export async function POST(req: NextRequest) {
     }
 
     const { email, password } = parsed.data;
-    const db = getDb();
+    const normalizedEmail = email.toLowerCase().trim();
 
-    // 2. Fetch user
-    const stmt = db.prepare(`
-      SELECT id, email, password_hash, salt, role, full_name, is_verified 
-      FROM users 
-      WHERE email = ?
-    `);
-    const user = stmt.get(email.toLowerCase().trim()) as any;
+    // Use the configured repository: Supabase or SQLite.
+    const repo = getActiveAuthRepository();
+    const user = await repo.getUserByEmail(normalizedEmail);
 
-    // Defend against account enumeration & timing attacks: always perform dummy verify if user not found
     let isValid = false;
+
     if (user) {
       isValid = verifyPassword(password, user.password_hash, user.salt);
     } else {
-      // Dummy constant-time work
+      // Dummy verification to reduce timing differences.
       verifyPassword(password, "00".repeat(64), "00".repeat(16));
     }
 
     if (!user || !isValid) {
       await logSecurityEvent({
         eventType: "failed_login",
-        email: email.toLowerCase().trim(),
+        email: normalizedEmail,
         ipAddress: ip,
         userAgent,
         severity: "medium",
         details: { reason: "Bad credentials or user not found" },
       });
+
       return NextResponse.json(
         { error: "Invalid email or password." },
         { status: 401 }
       );
     }
 
-    // 3. Issue Session Token
+    if (user.role !== "admin" && user.role !== "owner") {
+      return NextResponse.json(
+        { error: "Unauthorized role." },
+        { status: 403 }
+      );
+    }
+
     const sessionToken = signSession({
       userId: user.id,
       email: user.email,
@@ -106,20 +112,23 @@ export async function POST(req: NextRequest) {
       redirect: redirectPath,
     });
 
-    // 4. Set HttpOnly Secure Session Cookie
     response.cookies.set({
       name: SESSION_COOKIE_NAME,
       value: sessionToken,
       httpOnly: true,
-      secure: process.env.COOKIE_SECURE === "true" || (process.env.NODE_ENV === "production" && req.nextUrl.protocol === "https:"),
+      secure:
+        process.env.COOKIE_SECURE === "true" ||
+        (process.env.NODE_ENV === "production" &&
+          req.nextUrl.protocol === "https:"),
       sameSite: "lax",
       path: "/",
-      maxAge: 86400 * 7, // 7 days
+      maxAge: 86400 * 7,
     });
 
     return response;
-  } catch (error: any) {
+  } catch (error) {
     console.error("Login error:", error);
+
     return NextResponse.json(
       { error: "Internal server error. Please try again later." },
       { status: 500 }
