@@ -56,7 +56,7 @@ export async function POST(req: Request) {
       ...user,
       password_hash: auth.hash,
       salt: auth.salt,
-      is_verified: true,
+      is_verified: 1,
       created_at: now,
       updated_at: now,
     });
